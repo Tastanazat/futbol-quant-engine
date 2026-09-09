@@ -1,8 +1,10 @@
 streamlit
-supabase
 pandas
 numpy
-scikit-learn
 scipy
+scikit-learn
 xgboost
 lightgbm
+supabase
+plotly
+openpyxl
