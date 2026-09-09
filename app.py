@@ -1,2480 +1,737 @@
-import streamlit as st
-from supabase import create_client, Client
-from datetime import datetime, timezone
 import pandas as pd
-import math
-import json
-import statistics
-
-
-# =========================================================
-# FUTBOL QUANT ENGINE
-# MAÇ ÖNCESİ QUANT ENGINE
-# =========================================================
-
-st.set_page_config(
-    page_title="Futbol Quant Engine",
-    page_icon="⚽",
-    layout="wide"
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, brier_score_loss, log_loss
 )
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+import lightgbm as lgb
+from datetime import datetime, timedelta
+import json
+import os
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
 
-MODEL_VERSION = "FQE-PRE-1.0"
-
-
-# =========================================================
-# SUPABASE
-# =========================================================
-
-try:
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-
-    supabase: Client = create_client(
-        SUPABASE_URL,
-        SUPABASE_KEY
-    )
-
-    db_ok = True
-
-except Exception as e:
-    db_ok = False
-    supabase = None
-
-    st.error(
-        "Supabase bağlantısı kurulamadı.\n\n"
-        "Streamlit Secrets içine SUPABASE_URL ve "
-        "SUPABASE_KEY eklenmelidir."
-    )
-
-
-# =========================================================
-# GENEL YARDIMCILAR
-# =========================================================
-
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def pct(value):
-    return f"{safe_float(value) * 100:.2f}%"
-
-
-def fair_odd(probability):
-    if probability is None or probability <= 0:
-        return None
-
-    return round(1.0 / probability, 3)
-
-
-def poisson_probability(lmbda, goals):
+class MobileGoalAlert:
     """
-    P(X=k)
+    Telefon için optimize edilmiş İlk Gol Alarm Sistemi
     """
 
-    lmbda = max(0.0001, float(lmbda))
-    goals = int(goals)
+    def __init__(self, data_path=None):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.feature_columns = []
+        self.threshold = 0.65  # Alarm eşiği
+        self.min_data_points = 50  # Minimum veri noktası
+        self.alert_history = []
+        self.model_version = "1.0"
+        self.last_training_date = None
 
-    return (
-        math.exp(-lmbda)
-        * (lmbda ** goals)
-        / math.factorial(goals)
-    )
-
-
-def poisson_distribution(lmbda, max_goals=10):
-    probs = [
-        poisson_probability(lmbda, i)
-        for i in range(max_goals + 1)
-    ]
-
-    total = sum(probs)
-
-    if total > 0:
-        probs = [x / total for x in probs]
-
-    return probs
-
-
-# =========================================================
-# DATABASE HELPERS
-# =========================================================
-
-def fetch_table(table, select="*"):
-    if not db_ok:
-        return []
-
-    try:
-        response = (
-            supabase
-            .table(table)
-            .select(select)
-            .execute()
-        )
-
-        return response.data or []
-
-    except Exception as e:
-        st.error(f"{table} okunamadı: {e}")
-        return []
-
-
-def insert_row(table, data):
-    if not db_ok:
-        return None
-
-    try:
-        response = (
-            supabase
-            .table(table)
-            .insert(data)
-            .execute()
-        )
-
-        if response.data:
-            return response.data[0]
-
-        return None
-
-    except Exception as e:
-        st.error(f"{table} kayıt hatası: {e}")
-        return None
-
-
-def update_row(table, record_id, data):
-    if not db_ok:
-        return False
-
-    try:
-        (
-            supabase
-            .table(table)
-            .update(data)
-            .eq("id", record_id)
-            .execute()
-        )
-
-        return True
-
-    except Exception as e:
-        st.error(f"{table} güncelleme hatası: {e}")
-        return False
-
-
-def log_audit(table_name, record_id, action,
-              old_data=None, new_data=None):
-
-    if not db_ok:
-        return
-
-    try:
-        data = {
-            "table_name": table_name,
-            "record_id": record_id,
-            "action": action,
-            "old_data": old_data,
-            "new_data": new_data
-        }
-
-        (
-            supabase
-            .table("data_audit_log")
-            .insert(data)
-            .execute()
-        )
-
-    except Exception:
-        pass
-
-
-# =========================================================
-# VERİYİ ÇEK
-# =========================================================
-
-def get_matches():
-    return fetch_table(
-        "matches",
-        "*"
-    )
-
-
-def get_statistics():
-    return fetch_table(
-        "match_statistics",
-        "*"
-    )
-
-
-def get_odds():
-    return fetch_table(
-        "odds",
-        "*"
-    )
-
-
-def get_predictions():
-    return fetch_table(
-        "predictions",
-        "*"
-    )
-
-
-def get_prediction_results():
-    return fetch_table(
-        "prediction_results",
-        "*"
-    )
-
-
-# =========================================================
-# DATAFRAME OLUŞTUR
-# =========================================================
-
-def prepare_history():
-
-    matches = pd.DataFrame(get_matches())
-    stats = pd.DataFrame(get_statistics())
-
-    if matches.empty:
-        return pd.DataFrame()
-
-    matches["match_date"] = pd.to_datetime(
-        matches["match_date"],
-        errors="coerce"
-    )
-
-    if not stats.empty:
-
-        stats["match_id"] = stats["match_id"].astype(str)
-        matches["id"] = matches["id"].astype(str)
-
-        df = matches.merge(
-            stats,
-            left_on="id",
-            right_on="match_id",
-            how="left"
-        )
-
-    else:
-        df = matches.copy()
-
-    return df
-
-
-# =========================================================
-# TAMAMLANMIŞ MAÇLAR
-# =========================================================
-
-def completed_history():
-
-    df = prepare_history()
-
-    if df.empty:
-        return df
-
-    df = df[
-        df["home_score"].notna()
-        & df["away_score"].notna()
-    ].copy()
-
-    if "status" in df.columns:
-
-        completed_status = [
-            "completed",
-            "finished",
-            "settled",
-            "played"
+        # Özellik listesi (veri setindeki tüm önemli değişkenler)
+        self.feature_names = [
+            # Maç öncesi
+            'Home_Pos', 'Away_Pos',
+            # Alarm zamanı (Alert Time)
+            'H_Score', 'A_Score',
+            'H_Momentum', 'A_Momentum',
+            'H_xG', 'A_xG',
+            'H_SOT', 'A_SOT',
+            'H_SOFF', 'A_SOFF',
+            'H_Corners', 'A_Corners',
+            'H_Attacks', 'A_Attacks',
+            'H_Dn_Attacks', 'A_Dn_Attacks',
+            'H_Poss', 'A_Poss',
+            'H_Y_Cards', 'A_Y_Cards',
+            # Oranlar (Live Odds)
+            'Odds_Home', 'Odds_Draw', 'Odds_Away',
+            'Odds_Over_0.5', 'Odds_Under_0.5',
+            'Odds_Over_1.5', 'Odds_Under_1.5',
+            # Pre-Match Odds
+            'PM_Odds_Home', 'PM_Odds_Draw', 'PM_Odds_Away',
+            'PM_Odds_Over_0.5', 'PM_Odds_Under_0.5',
         ]
 
-        status_mask = (
-            df["status"]
-            .astype(str)
-            .str.lower()
-            .isin(completed_status)
+        if data_path and os.path.exists(data_path):
+            self.load_data(data_path)
+
+    def load_data(self, file_path):
+        """Veri setini yükle ve işle"""
+        print(f"📊 Veri yükleniyor: {file_path}")
+        self.raw_data = pd.read_csv(file_path, encoding='utf-8-sig')
+        self.process_data()
+        return self
+
+    def process_data(self):
+        """Veriyi model için hazırla"""
+        df = self.raw_data.copy()
+
+        # İlk gol dakikasını çıkar
+        def extract_first_goal(row):
+            if pd.isna(row.get('Goal Times', '')):
+                return None
+            goals = str(row['Goal Times']).split(',')
+            if goals and goals[0].strip().isdigit():
+                return int(goals[0].strip())
+            return None
+
+        df['First_Goal_Minute'] = df.apply(extract_first_goal, axis=1)
+
+        # İlk gol var mı?
+        df['Has_Goal'] = df['First_Goal_Minute'].notna().astype(int)
+
+        # Alarm zamanından ilk gole kadar geçen süre
+        def get_alert_time(row):
+            try:
+                if pd.isna(row.get('Date', '')):
+                    return None
+                date_str = str(row['Date']).strip()
+                if ' ' in date_str:
+                    return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                return datetime.strptime(date_str, '%Y-%m-%d')
+            except:
+                return None
+
+        df['Alert_Time'] = df.apply(get_alert_time, axis=1)
+
+        # Hedef değişken: 15 dakika içinde gol olacak mı?
+        def target_15min(row):
+            if pd.isna(row.get('First_Goal_Minute')) or pd.isna(row.get('Alert_Time')):
+                return 0
+            # Alarm dakikasını hesapla
+            alert_time = row['Alert_Time']
+            # Maçın başlangıcından itibaren kaç dakika geçmiş?
+            # Basitleştirilmiş: Alert_Time'ı dakika olarak kullan
+            if isinstance(alert_time, datetime):
+                # Alert_Time'dan dakika çıkar (örnek: 15:30 -> 15)
+                alert_minute = alert_time.minute
+            else:
+                alert_minute = 0
+            # İlk gol dakikası ile karşılaştır
+            if row['First_Goal_Minute'] <= alert_minute + 15:
+                return 1
+            return 0
+
+        df['Target_15min'] = df.apply(target_15min, axis=1)
+
+        # Özellikleri hazırla
+        feature_data = {}
+        for feat in self.feature_names:
+            if feat in df.columns:
+                feature_data[feat] = df[feat].fillna(0).values
+            else:
+                # Kolon yoksa 0 ile doldur
+                feature_data[feat] = np.zeros(len(df))
+
+        self.X = pd.DataFrame(feature_data)
+        self.y = df['Target_15min'].fillna(0).values
+        self.first_goal_minutes = df['First_Goal_Minute'].fillna(0).values
+
+        print(f"✅ Veri işlendi: {len(self.X)} maç, {len(self.feature_names)} özellik")
+        return self
+
+    def train_model(self):
+        """Modeli eğit"""
+        print("🧠 Model eğitiliyor...")
+
+        # Eksik değerleri doldur
+        X = self.X.fillna(0)
+        y = self.y
+
+        # Eğitim/test böl
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
         )
 
-        # Skor varsa status farklı olsa bile maçı koru.
-        df = df[
-            status_mask
-            | (
-                df["home_score"].notna()
-                & df["away_score"].notna()
-            )
-        ]
+        # Ölçeklendir
+        self.scaler.fit(X_train)
+        X_train_scaled = self.scaler.transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
 
-    return df
-
-
-# =========================================================
-# TAKIM FORM VERİSİ
-# =========================================================
-
-def team_match_rows(team, history):
-
-    if history.empty:
-        return pd.DataFrame()
-
-    home = history[
-        history["home_team"].astype(str).str.lower()
-        == team.lower()
-    ].copy()
-
-    away = history[
-        history["away_team"].astype(str).str.lower()
-        == team.lower()
-    ].copy()
-
-    return pd.concat(
-        [home, away],
-        ignore_index=True
-    )
-
-
-# =========================================================
-# SON MAÇLAR
-# =========================================================
-
-def recent_team_matches(team, history, limit=10):
-
-    df = team_match_rows(team, history)
-
-    if df.empty:
-        return df
-
-    if "match_date" in df.columns:
-        df = df.sort_values(
-            "match_date",
-            ascending=False
+        # Model oluştur (XGBoost + LightGBM + Random Forest ensemble)
+        print("  - XGBoost eğitiliyor...")
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            use_label_encoder=False,
+            eval_metric='logloss'
         )
+        xgb_model.fit(X_train_scaled, y_train)
 
-    return df.head(limit)
+        print("  - LightGBM eğitiliyor...")
+        lgb_model = lgb.LGBMClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            verbose=-1
+        )
+        lgb_model.fit(X_train_scaled, y_train)
 
+        print("  - Random Forest eğitiliyor...")
+        rf_model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=8,
+            random_state=42
+        )
+        rf_model.fit(X_train_scaled, y_train)
 
-# =========================================================
-# TAKIM METRİKLERİ
-# =========================================================
+        # Ensemble model
+        class EnsembleModel:
+            def __init__(self, models):
+                self.models = models
 
-def team_metrics(team, history, limit=10):
+            def predict_proba(self, X):
+                probs = []
+                for model in self.models:
+                    if hasattr(model, 'predict_proba'):
+                        probs.append(model.predict_proba(X)[:, 1])
+                return np.mean(probs, axis=0)
 
-    df = recent_team_matches(
-        team,
-        history,
-        limit
-    )
+            def predict(self, X):
+                return (self.predict_proba(X) > 0.5).astype(int)
 
-    if df.empty:
+        self.model = EnsembleModel([xgb_model, lgb_model, rf_model])
+        self.feature_columns = X.columns.tolist()
+
+        # Performans metrikleri
+        y_pred_proba = self.model.predict_proba(X_test_scaled)
+        y_pred = (y_pred_proba > 0.5).astype(int)
+
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        try:
+            roc_auc = roc_auc_score(y_test, y_pred_proba)
+        except:
+            roc_auc = 0.5
+
+        print(f"\n📊 Model Performansı:")
+        print(f"  Accuracy:  {accuracy:.3f}")
+        print(f"  Precision: {precision:.3f}")
+        print(f"  Recall:    {recall:.3f}")
+        print(f"  F1 Score:  {f1:.3f}")
+        print(f"  ROC-AUC:   {roc_auc:.3f}")
+
+        # En iyi eşiği bul
+        self.find_optimal_threshold(X_test_scaled, y_test)
+
+        self.last_training_date = datetime.now()
+        self.model_version = f"v{datetime.now().strftime('%Y%m%d')}"
+
+        # Modeli kaydet
+        self.save_model()
+
+        return self
+
+    def find_optimal_threshold(self, X, y):
+        """En iyi alarm eşiğini bul"""
+        thresholds = np.arange(0.3, 0.9, 0.05)
+        best_f1 = 0
+        best_threshold = 0.65
+
+        y_proba = self.model.predict_proba(X)
+
+        for thresh in thresholds:
+            y_pred = (y_proba > thresh).astype(int)
+            try:
+                f1 = f1_score(y, y_pred, zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_threshold = thresh
+            except:
+                continue
+
+        self.threshold = best_threshold
+        print(f"  ✅ Optimal eşik: {best_threshold:.2f} (F1: {best_f1:.3f})")
+        return best_threshold
+
+    def predict_match(self, match_data):
+        """
+        Canlı maç için tahmin yap
+
+        Args:
+            match_data: dict - Canlı istatistikler
+
+        Returns:
+            dict: Tahmin sonuçları
+        """
+        if self.model is None:
+            print("⚠️ Model eğitilmemiş!")
+            return None
+
+        # Gelen veriyi DataFrame'e çevir
+        df = pd.DataFrame([match_data])
+
+        # Eksik özellikleri doldur
+        for feat in self.feature_columns:
+            if feat not in df.columns:
+                df[feat] = 0
+
+        df = df[self.feature_columns].fillna(0)
+
+        # Ölçeklendir
+        X_scaled = self.scaler.transform(df)
+
+        # Tahmin
+        prob = self.model.predict_proba(X_scaled)[0]
+
+        # Alarm kararı
+        alert = prob >= self.threshold
+
+        # Güven skoru (0-100)
+        confidence = min(100, int(prob * 100 * 1.2))
+
+        # Risk skoru
+        risk = 100 - confidence
+
+        # Beklenen gol dakikası
+        expected_minute = self.estimate_goal_time(df)
+
+        # Benzer maçları bul
+        similar_matches = self.find_similar_matches(df, n=10)
+
         return {
-            "matches": 0,
-            "gf": None,
-            "ga": None,
-            "xgf": None,
-            "xga": None,
-            "shots": None,
-            "shots_on_target": None,
-            "corners": None
+            'alert': alert,
+            'probability': round(prob * 100, 1),
+            'confidence': min(100, confidence),
+            'risk': min(100, risk),
+            'expected_goal_minute': expected_minute,
+            'threshold': round(self.threshold * 100, 1),
+            'similar_matches_count': len(similar_matches),
+            'similar_success_rate': self.calculate_similar_success(similar_matches),
+            'timestamp': datetime.now().isoformat()
         }
 
-    rows = []
+    def estimate_goal_time(self, match_features):
+        """Beklenen gol dakikasını tahmin et"""
+        # Basit tahmin: ortalama ilk gol dakikası + xG ve baskıya göre düzeltme
+        base = 30  # Varsayılan ortalama
 
-    for _, r in df.iterrows():
+        # xG'ye göre düzeltme
+        h_xg = match_features.get('H_xG', 0.5)
+        a_xg = match_features.get('A_xG', 0.5)
+        xg_factor = max(0.5, min(2.0, (h_xg + a_xg) / 0.5))
 
-        is_home = (
-            str(r["home_team"]).lower()
-            == team.lower()
-        )
+        # Momentum'a göre düzeltme
+        h_mom = match_features.get('H_Momentum', 50)
+        a_mom = match_features.get('A_Momentum', 50)
+        momentum_factor = 1 + (h_mom - a_mom) / 100
 
-        if is_home:
+        # Korner faktörü
+        corners = match_features.get('H_Corners', 0) + match_features.get('A_Corners', 0)
+        corner_factor = 1 - (corners / 20) * 0.1
 
-            gf = safe_float(r.get("home_score"))
-            ga = safe_float(r.get("away_score"))
+        estimated = base / (xg_factor * momentum_factor * corner_factor)
+        return max(5, min(90, int(estimated)))
 
-            xgf = safe_float(r.get("home_xg"), None)
-            xga = safe_float(r.get("away_xg"), None)
+    def find_similar_matches(self, match_features, n=10):
+        """Benzer maçları bul (KNN)"""
+        if len(self.X) < n:
+            return []
 
-            shots = safe_float(
-                r.get("home_shots"),
-                None
-            )
+        # Basit benzerlik: xG ve momentum
+        h_xg = match_features.get('H_xG', 0.5)
+        a_xg = match_features.get('A_xG', 0.5)
 
-            sot = safe_float(
-                r.get("home_shots_on_target"),
-                None
-            )
+        similarities = []
+        for idx, row in self.X.iterrows():
+            sim = 1 - (abs(row.get('H_xG', 0.5) - h_xg) + abs(row.get('A_xG', 0.5) - a_xg))
+            similarities.append((idx, sim))
 
-            corners = safe_float(
-                r.get("home_corners"),
-                None
-            )
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return [idx for idx, _ in similarities[:n]]
 
+    def calculate_similar_success(self, similar_indices):
+        """Benzer maçların başarı oranı"""
+        if not similar_indices:
+            return 0
+
+        success = sum(self.y[idx] for idx in similar_indices if idx < len(self.y))
+        return success / len(similar_indices)
+
+    def save_model(self, path="goal_alert_model.pkl"):
+        """Modeli kaydet"""
+        model_data = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'feature_columns': self.feature_columns,
+            'threshold': self.threshold,
+            'model_version': self.model_version,
+            'last_training_date': self.last_training_date
+        }
+        joblib.dump(model_data, path)
+        print(f"💾 Model kaydedildi: {path}")
+
+    def load_model(self, path="goal_alert_model.pkl"):
+        """Modeli yükle"""
+        if os.path.exists(path):
+            model_data = joblib.load(path)
+            self.model = model_data['model']
+            self.scaler = model_data['scaler']
+            self.feature_columns = model_data['feature_columns']
+            self.threshold = model_data['threshold']
+            self.model_version = model_data.get('model_version', 'unknown')
+            self.last_training_date = model_data.get('last_training_date', None)
+            print(f"📂 Model yüklendi: {path} (v{self.model_version})")
+            return True
+        print("⚠️ Model dosyası bulunamadı!")
+        return False
+
+
+class MatchSimulator:
+    """Canlı maç simülatörü (test için)"""
+
+    def __init__(self, model):
+        self.model = model
+        self.current_match = None
+
+    def simulate_match(self, match_id=1):
+        """Test maçı simüle et"""
+        print(f"\n⚽ Maç {match_id} simüle ediliyor...")
+
+        # Örnek maç verisi
+        match_data = {
+            'Home_Pos': 3,
+            'Away_Pos': 8,
+            'H_Score': 0,
+            'A_Score': 0,
+            'H_Momentum': 65,
+            'A_Momentum': 35,
+            'H_xG': 0.8,
+            'A_xG': 0.2,
+            'H_SOT': 4,
+            'A_SOT': 1,
+            'H_Corners': 3,
+            'A_Corners': 1,
+            'H_Attacks': 28,
+            'A_Attacks': 15,
+            'H_Dn_Attacks': 12,
+            'A_Dn_Attacks': 5,
+            'H_Poss': 62,
+            'A_Poss': 38,
+            'H_Y_Cards': 0,
+            'A_Y_Cards': 1,
+            'Odds_Home': 1.8,
+            'Odds_Draw': 3.5,
+            'Odds_Away': 4.2,
+            'Odds_Over_0.5': 1.25,
+            'Odds_Under_0.5': 3.5,
+            'PM_Odds_Home': 1.9,
+            'PM_Odds_Draw': 3.4,
+            'PM_Odds_Away': 4.0,
+            'PM_Odds_Over_0.5': 1.22,
+            'PM_Odds_Under_0.5': 3.8,
+        }
+
+        # 3 farklı senaryo
+        scenarios = [
+            ("Baskılı Atak", {
+                'H_Momentum': 72, 'H_xG': 1.2, 'H_SOT': 6,
+                'H_Corners': 5, 'H_Dn_Attacks': 18
+            }),
+            ("Dengeli Maç", {
+                'H_Momentum': 52, 'A_Momentum': 48, 'H_xG': 0.5,
+                'A_xG': 0.4, 'H_SOT': 2, 'A_SOT': 2
+            }),
+            ("Savunma Ağırlıklı", {
+                'H_Momentum': 30, 'A_Momentum': 70, 'H_xG': 0.1,
+                'A_xG': 0.8, 'H_SOT': 0, 'A_SOT': 5
+            })
+        ]
+
+        results = []
+        for name, updates in scenarios:
+            data = match_data.copy()
+            data.update(updates)
+
+            result = self.model.predict_match(data)
+
+            if result:
+                result['scenario'] = name
+                results.append(result)
+
+                print(f"\n📊 {name}:")
+                print(f"  İlk Gol Olasılığı: {result['probability']}%")
+                print(f"  Alarm: {'🔔 VER' if result['alert'] else '❌ VERME'}")
+                print(f"  Güven: {result['confidence']}/100")
+                print(f"  Risk: {result['risk']}/100")
+                print(f"  Beklenen Gol: {result['expected_goal_minute']}. dakika")
+
+        return results
+
+
+class MobileApp:
+    """Telefon uygulaması arayüzü"""
+
+    def __init__(self):
+        self.model = None
+        self.simulator = None
+
+    def start(self):
+        """Uygulamayı başlat"""
+        print("\n" + "="*50)
+        print("   📱 MOBİL İLK GOL ALARM SİSTEMİ")
+        print("="*50)
+
+        # Veri dosyasını kontrol et
+        data_file = input("\n📂 Veri dosyası yolu (boş bırak=CSV varsayılan): ").strip()
+        if not data_file:
+            data_file = "InPlayGuru_Strategy_1050497_Picks_1784327580.csv"
+
+        # Modeli yükle veya oluştur
+        self.model = MobileGoalAlert()
+
+        if os.path.exists(data_file):
+            self.model.load_data(data_file)
+            self.model.train_model()
         else:
+            print(f"⚠️ Veri dosyası bulunamadı: {data_file}")
+            print("   Örnek veri ile devam ediliyor...")
+            self.create_sample_data()
+            self.model.train_model()
 
-            gf = safe_float(r.get("away_score"))
-            ga = safe_float(r.get("home_score"))
+        self.simulator = MatchSimulator(self.model)
 
-            xgf = safe_float(r.get("away_xg"), None)
-            xga = safe_float(r.get("home_xg"), None)
+        # Ana menü
+        self.main_menu()
 
-            shots = safe_float(
-                r.get("away_shots"),
-                None
-            )
+    def create_sample_data(self):
+        """Örnek veri oluştur"""
+        print("📊 Örnek veri oluşturuluyor...")
 
-            sot = safe_float(
-                r.get("away_shots_on_target"),
-                None
-            )
+        # 1000 örnek maç verisi
+        np.random.seed(42)
+        n = 1000
 
-            corners = safe_float(
-                r.get("away_corners"),
-                None
-            )
+        data = {
+            'Home_Pos': np.random.randint(1, 20, n),
+            'Away_Pos': np.random.randint(1, 20, n),
+            'H_Score': np.random.randint(0, 3, n),
+            'A_Score': np.random.randint(0, 3, n),
+            'H_Momentum': np.random.randint(10, 90, n),
+            'A_Momentum': np.random.randint(10, 90, n),
+            'H_xG': np.random.uniform(0.1, 2.5, n),
+            'A_xG': np.random.uniform(0.1, 2.5, n),
+            'H_SOT': np.random.randint(0, 15, n),
+            'A_SOT': np.random.randint(0, 15, n),
+            'H_Corners': np.random.randint(0, 12, n),
+            'A_Corners': np.random.randint(0, 12, n),
+            'H_Attacks': np.random.randint(5, 80, n),
+            'A_Attacks': np.random.randint(5, 80, n),
+            'H_Dn_Attacks': np.random.randint(0, 40, n),
+            'A_Dn_Attacks': np.random.randint(0, 40, n),
+            'H_Poss': np.random.randint(20, 80, n),
+            'A_Poss': np.random.randint(20, 80, n),
+            'H_Y_Cards': np.random.randint(0, 4, n),
+            'A_Y_Cards': np.random.randint(0, 4, n),
+            'Goal Times': [f"{np.random.randint(5, 90)}" for _ in range(n)],
+            'Date': [datetime.now().strftime('%Y-%m-%d %H:%M:%S') for _ in range(n)],
+        }
 
-        rows.append({
-            "gf": gf,
-            "ga": ga,
-            "xgf": xgf,
-            "xga": xga,
-            "shots": shots,
-            "sot": sot,
-            "corners": corners
+        self.raw_data = pd.DataFrame(data)
+        self.model.raw_data = self.raw_data
+        self.model.process_data()
+
+    def main_menu(self):
+        """Ana menü"""
+        while True:
+            print("\n" + "="*50)
+            print("   📱 ANA MENÜ")
+            print("="*50)
+            print("1️⃣  Canlı Maç Tahmini (Simülasyon)")
+            print("2️⃣  Maç Verisi Gir (Manuel)")
+            print("3️⃣  Model Performansı")
+            print("4️⃣  Simülasyon Çalıştır")
+            print("5️⃣  Çıkış")
+
+            choice = input("\nSeçiminiz (1-5): ").strip()
+
+            if choice == '1':
+                self.live_match_simulation()
+            elif choice == '2':
+                self.manual_match_input()
+            elif choice == '3':
+                self.show_performance()
+            elif choice == '4':
+                self.run_batch_simulation()
+            elif choice == '5':
+                print("\n👋 Çıkış yapılıyor...")
+                break
+            else:
+                print("❌ Geçersiz seçim!")
+
+    def live_match_simulation(self):
+        """Canlı maç simülasyonu"""
+        print("\n" + "="*50)
+        print("   🟢 CANLI MAÇ TAHMİNİ")
+        print("="*50)
+
+        match_id = input("\nMaç ID (boş bırak=1): ").strip()
+        match_id = int(match_id) if match_id else 1
+
+        results = self.simulator.simulate_match(match_id)
+
+        if results:
+            print("\n" + "="*50)
+            print("   📊 TAHMİN ÖZETİ")
+            print("="*50)
+
+            for r in results:
+                status = "🔔 ALARM" if r['alert'] else "⏸️ BEKLE"
+                print(f"\n{r['scenario']}:")
+                print(f"  {status} | Olasılık: {r['probability']}% | Güven: {r['confidence']}/100")
+                print(f"  ⏱️ Beklenen Gol: {r['expected_goal_minute']}. dakika")
+
+    def manual_match_input(self):
+        """Manuel maç verisi gir"""
+        print("\n" + "="*50)
+        print("   ✏️ MANUEL MAÇ VERİSİ")
+        print("="*50)
+
+        print("\nLütfen maç istatistiklerini girin:")
+        print("(Boş bırakılan alanlar varsayılan değer alır)")
+
+        data = {
+            'Home_Pos': int(input("Ev Takımı Sıralaması (1-20): ") or 10),
+            'Away_Pos': int(input("Deplasman Sıralaması (1-20): ") or 10),
+            'H_Score': int(input("Ev Gol: ") or 0),
+            'A_Score': int(input("Deplasman Gol: ") or 0),
+            'H_Momentum': int(input("Ev Takımı Momentum (0-100): ") or 50),
+            'A_Momentum': int(input("Deplasman Momentum (0-100): ") or 50),
+            'H_xG': float(input("Ev xG: ") or 0.5),
+            'A_xG': float(input("Deplasman xG: ") or 0.5),
+            'H_SOT': int(input("Ev İsabetli Şut: ") or 2),
+            'A_SOT': int(input("Deplasman İsabetli Şut: ") or 2),
+            'H_Corners': int(input("Ev Korner: ") or 3),
+            'A_Corners': int(input("Deplasman Korner: ") or 3),
+            'H_Attacks': int(input("Ev Atak: ") or 30),
+            'A_Attacks': int(input("Deplasman Atak: ") or 30),
+            'H_Dn_Attacks': int(input("Ev Tehlikeli Atak: ") or 10),
+            'A_Dn_Attacks': int(input("Deplasman Tehlikeli Atak: ") or 10),
+            'H_Poss': int(input("Ev Topa Sahip Olma (%): ") or 50),
+            'A_Poss': int(input("Deplasman Topa Sahip Olma (%): ") or 50),
+            'H_Y_Cards': int(input("Ev Sarı Kart: ") or 0),
+            'A_Y_Cards': int(input("Deplasman Sarı Kart: ") or 0),
+        }
+
+        # Oranlar (varsayılan)
+        data.update({
+            'Odds_Home': 2.0,
+            'Odds_Draw': 3.5,
+            'Odds_Away': 3.5,
+            'Odds_Over_0.5': 1.3,
+            'Odds_Under_0.5': 3.5,
+            'PM_Odds_Home': 2.1,
+            'PM_Odds_Draw': 3.4,
+            'PM_Odds_Away': 3.4,
+            'PM_Odds_Over_0.5': 1.25,
+            'PM_Odds_Under_0.5': 3.6,
         })
 
-    result = {
-        "matches": len(rows),
-    }
-
-    for key in [
-        "gf",
-        "ga",
-        "xgf",
-        "xga",
-        "shots",
-        "sot",
-        "corners"
-    ]:
-
-        values = [
-            x[key]
-            for x in rows
-            if x[key] is not None
-        ]
-
-        result[key] = (
-            sum(values) / len(values)
-            if values
-            else None
-        )
-
-    return result
-
-
-# =========================================================
-# EV
-# =========================================================
-
-def expected_value(probability, odds):
-
-    probability = safe_float(probability)
-    odds = safe_float(odds)
-
-    if probability <= 0 or odds <= 1:
-        return None
-
-    return probability * odds - 1
-
-
-# =========================================================
-# QUARTER KELLY
-# =========================================================
-
-def quarter_kelly(probability, odds,
-                  bankroll,
-                  max_fraction=0.02):
-
-    probability = safe_float(probability)
-    odds = safe_float(odds)
-    bankroll = safe_float(bankroll)
-
-    if (
-        probability <= 0
-        or odds <= 1
-        or bankroll <= 0
-    ):
-        return 0.0
-
-    b = odds - 1
-
-    q = 1 - probability
-
-    full_kelly = (
-        (b * probability - q) / b
-    )
-
-    if full_kelly <= 0:
-        return 0.0
-
-    stake_fraction = min(
-        full_kelly * 0.25,
-        max_fraction
-    )
-
-    return round(
-        bankroll * stake_fraction,
-        2
-    )
-
-
-# =========================================================
-# λ MODEL
-# =========================================================
-
-def calculate_lambdas(
-    home_team,
-    away_team,
-    history,
-    sample=10
-):
-
-    home_recent = recent_team_matches(
-        home_team,
-        history,
-        sample
-    )
-
-    away_recent = recent_team_matches(
-        away_team,
-        history,
-        sample
-    )
-
-    home_metrics = team_metrics(
-        home_team,
-        history,
-        sample
-    )
-
-    away_metrics = team_metrics(
-        away_team,
-        history,
-        sample
-    )
-
-    if (
-        home_metrics["matches"] == 0
-        or away_metrics["matches"] == 0
-    ):
-        return None
-
-    # -----------------------------------------------------
-    # TEMEL GOL MODELİ
-    # -----------------------------------------------------
-
-    home_attack = (
-        home_metrics["xgf"]
-        if home_metrics["xgf"] is not None
-        else home_metrics["gf"]
-    )
-
-    home_defense = (
-        home_metrics["xga"]
-        if home_metrics["xga"] is not None
-        else home_metrics["ga"]
-    )
-
-    away_attack = (
-        away_metrics["xgf"]
-        if away_metrics["xgf"] is not None
-        else away_metrics["gf"]
-    )
-
-    away_defense = (
-        away_metrics["xga"]
-        if away_metrics["xga"] is not None
-        else away_metrics["ga"]
-    )
-
-    # Attack + opponent defence blend
-    raw_home = (
-        0.60 * home_attack
-        + 0.40 * away_defense
-    )
-
-    raw_away = (
-        0.60 * away_attack
-        + 0.40 * home_defense
-    )
-
-    # -----------------------------------------------------
-    # SONUÇ GOLLERİ İLE xG'Yİ BLEND ET
-    # -----------------------------------------------------
-
-    if (
-        home_metrics["xgf"] is not None
-        and home_metrics["gf"] is not None
-    ):
-
-        home_goal_signal = (
-            0.70 * home_metrics["xgf"]
-            + 0.30 * home_metrics["gf"]
-        )
-
-        raw_home = (
-            0.70 * raw_home
-            + 0.30 * home_goal_signal
-        )
-
-    if (
-        away_metrics["xgf"] is not None
-        and away_metrics["gf"] is not None
-    ):
-
-        away_goal_signal = (
-            0.70 * away_metrics["xgf"]
-            + 0.30 * away_metrics["gf"]
-        )
-
-        raw_away = (
-            0.70 * raw_away
-            + 0.30 * away_goal_signal
-        )
-
-    # -----------------------------------------------------
-    # EV SAHİBİ AVANTAJI
-    # -----------------------------------------------------
-
-    raw_home *= 1.08
-    raw_away *= 0.94
-
-    # -----------------------------------------------------
-    # AŞIRI λ'YI SINIRLA
-    # -----------------------------------------------------
-
-    lambda_home = max(
-        0.15,
-        min(raw_home, 4.50)
-    )
-
-    lambda_away = max(
-        0.15,
-        min(raw_away, 4.50)
-    )
-
-    return {
-        "lambda_home": round(lambda_home, 4),
-        "lambda_away": round(lambda_away, 4),
-        "home_metrics": home_metrics,
-        "away_metrics": away_metrics
-    }
-
-
-# =========================================================
-# POISSON MAÇ OLASILIKLARI
-# =========================================================
-
-def calculate_match_probabilities(
-    lambda_home,
-    lambda_away,
-    max_goals=10
-):
-
-    home_dist = poisson_distribution(
-        lambda_home,
-        max_goals
-    )
-
-    away_dist = poisson_distribution(
-        lambda_away,
-        max_goals
-    )
-
-    home_win = 0
-    draw = 0
-    away_win = 0
-
-    over_15 = 0
-    over_25 = 0
-    over_35 = 0
-
-    btts_yes = 0
-
-    score_matrix = []
-
-    for h in range(max_goals + 1):
-
-        row = []
-
-        for a in range(max_goals + 1):
-
-            p = (
-                home_dist[h]
-                * away_dist[a]
-            )
-
-            row.append(p)
-
-            if h > a:
-                home_win += p
-
-            elif h == a:
-                draw += p
-
-            else:
-                away_win += p
-
-            total = h + a
-
-            if total >= 2:
-                over_15 += p
-
-            if total >= 3:
-                over_25 += p
-
-            if total >= 4:
-                over_35 += p
-
-            if h >= 1 and a >= 1:
-                btts_yes += p
-
-        score_matrix.append(row)
-
-    # normalize 1X2
-    total_1x2 = (
-        home_win
-        + draw
-        + away_win
-    )
-
-    if total_1x2 > 0:
-
-        home_win /= total_1x2
-        draw /= total_1x2
-        away_win /= total_1x2
-
-    return {
-        "home_win": home_win,
-        "draw": draw,
-        "away_win": away_win,
-        "btts_yes": btts_yes,
-        "btts_no": 1 - btts_yes,
-        "over_15": over_15,
-        "under_15": 1 - over_15,
-        "over_25": over_25,
-        "under_25": 1 - over_25,
-        "over_35": over_35,
-        "under_35": 1 - over_35,
-        "matrix": score_matrix
-    }
-
-
-# =========================================================
-# TOP SCORE
-# =========================================================
-
-def top_scores(
-    lambda_home,
-    lambda_away,
-    count=10
-):
-
-    scores = []
-
-    for h in range(0, 8):
-
-        for a in range(0, 8):
-
-            p = (
-                poisson_probability(lambda_home, h)
-                * poisson_probability(lambda_away, a)
-            )
-
-            scores.append({
-                "Skor": f"{h}-{a}",
-                "Olasılık": p
-            })
-
-    scores.sort(
-        key=lambda x: x["Olasılık"],
-        reverse=True
-    )
-
-    return scores[:count]
-
-
-# =========================================================
-# MARKETLER
-# =========================================================
-
-def build_markets(prob):
-
-    return [
-        {
-            "market": "1X2",
-            "selection": "1",
-            "probability": prob["home_win"]
-        },
-        {
-            "market": "1X2",
-            "selection": "X",
-            "probability": prob["draw"]
-        },
-        {
-            "market": "1X2",
-            "selection": "2",
-            "probability": prob["away_win"]
-        },
-        {
-            "market": "KG",
-            "selection": "VAR",
-            "probability": prob["btts_yes"]
-        },
-        {
-            "market": "KG",
-            "selection": "YOK",
-            "probability": prob["btts_no"]
-        },
-        {
-            "market": "ÜST/ALT 1.5",
-            "selection": "ÜST 1.5",
-            "probability": prob["over_15"]
-        },
-        {
-            "market": "ÜST/ALT 1.5",
-            "selection": "ALT 1.5",
-            "probability": prob["under_15"]
-        },
-        {
-            "market": "ÜST/ALT 2.5",
-            "selection": "ÜST 2.5",
-            "probability": prob["over_25"]
-        },
-        {
-            "market": "ÜST/ALT 2.5",
-            "selection": "ALT 2.5",
-            "probability": prob["under_25"]
-        },
-        {
-            "market": "ÜST/ALT 3.5",
-            "selection": "ÜST 3.5",
-            "probability": prob["over_35"]
-        },
-        {
-            "market": "ÜST/ALT 3.5",
-            "selection": "ALT 3.5",
-            "probability": prob["under_35"]
-        }
-    ]
-
-
-# =========================================================
-# ORANLARI MARKETLERE EŞLEŞTİR
-# =========================================================
-
-def odds_for_match(match_id):
-
-    rows = get_odds()
-
-    result = []
-
-    for r in rows:
-
-        if str(r.get("match_id")) == str(match_id):
-
-            result.append(r)
-
-    return result
-
-
-# =========================================================
-# BANKROLL
-# =========================================================
-
-def get_current_bankroll(default_bankroll=10000):
-
-    history = fetch_table(
-        "bankroll_history",
-        "*"
-    )
-
-    if not history:
-        return default_bankroll
-
-    df = pd.DataFrame(history)
-
-    if df.empty:
-        return default_bankroll
-
-    if "created_at" in df.columns:
-
-        df["created_at"] = pd.to_datetime(
-            df["created_at"],
-            errors="coerce"
-        )
-
-        df = df.sort_values(
-            "created_at"
-        )
-
-    last = df.iloc[-1]
-
-    value = last.get("bankroll_after")
-
-    if value is None:
-        return default_bankroll
-
-    return safe_float(
-        value,
-        default_bankroll
-    )
-
-
-# =========================================================
-# PREDICTION KAYDET
-# =========================================================
-
-def save_prediction(
-    match_id,
-    market,
-    selection,
-    probability,
-    fair_odds,
-    bookmaker_odds,
-    ev,
-    confidence,
-    decision,
-    stake,
-    bankroll_before
-):
-
-    data = {
-        "match_id": match_id,
-        "model_version": MODEL_VERSION,
-        "market": market,
-        "selection": selection,
-        "predicted_probability": round(
-            probability,
-            6
-        ),
-        "fair_odds": fair_odds,
-        "bookmaker_odds": bookmaker_odds,
-        "expected_value": (
-            round(ev, 6)
-            if ev is not None
-            else None
-        ),
-        "confidence": round(
-            confidence,
-            4
-        ),
-        "decision": decision,
-        "stake": round(stake, 2),
-        "bankroll_before": round(
-            bankroll_before,
-            2
-        )
-    }
-
-    row = insert_row(
-        "predictions",
-        data
-    )
-
-    if row:
-
-        log_audit(
-            "predictions",
-            row.get("id"),
-            "INSERT",
-            None,
-            data
-        )
-
-    return row
-
-
-# =========================================================
-# BAŞLIK
-# =========================================================
-
-st.title("⚽ FUTBOL QUANT ENGINE")
-
-st.caption(
-    "MAÇ ÖNCESİ • MODEL LOCK • POISSON • FAIR ODDS • EV • RİSK • KALİBRASYON"
-)
-
-
-if not db_ok:
-    st.stop()
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-st.sidebar.header("⚙️ Motor Ayarları")
-
-sample_size = st.sidebar.slider(
-    "Form örneklemi",
-    min_value=4,
-    max_value=20,
-    value=10
-)
-
-min_ev = st.sidebar.slider(
-    "Minimum EV",
-    min_value=0.00,
-    max_value=0.20,
-    value=0.05,
-    step=0.01
-)
-
-min_confidence = st.sidebar.slider(
-    "Minimum Confidence",
-    min_value=0.50,
-    max_value=0.95,
-    value=0.60,
-    step=0.01
-)
-
-default_bankroll = st.sidebar.number_input(
-    "Başlangıç Kasa",
-    min_value=0.0,
-    value=10000.0,
-    step=100.0
-)
-
-
-# =========================================================
-# MENÜ
-# =========================================================
-
-menu = st.sidebar.radio(
-    "MENÜ",
-    [
-        "🏠 Dashboard",
-        "➕ Maç Ekle",
-        "📊 Maç Öncesi Analiz",
-        "💰 Oran Ekle",
-        "🏁 Sonuç Gir",
-        "📚 Tahmin Geçmişi",
-        "📈 Performans",
-        "🧠 Kalibrasyon"
-    ]
-)
-
-
-# =========================================================
-# DASHBOARD
-# =========================================================
-
-if menu == "🏠 Dashboard":
-
-    st.subheader("🏠 Quant Engine Dashboard")
-
-    history = completed_history()
-
-    predictions = pd.DataFrame(
-        get_predictions()
-    )
-
-    results = pd.DataFrame(
-        get_prediction_results()
-    )
-
-    bankroll = get_current_bankroll(
-        default_bankroll
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "💰 Kasa",
-        f"{bankroll:.2f} TL"
-    )
-
-    c2.metric(
-        "📚 Tamamlanan Maç",
-        len(history)
-    )
-
-    c3.metric(
-        "🧠 Tahmin",
-        len(predictions)
-    )
-
-    c4.metric(
-        "🏁 Sonuç",
-        len(results)
-    )
-
-    st.divider()
-
-    if not predictions.empty:
-
-        st.subheader(
-            "Son Tahminler"
-        )
-
-        cols = [
-            "market",
-            "selection",
-            "predicted_probability",
-            "fair_odds",
-            "bookmaker_odds",
-            "expected_value",
-            "confidence",
-            "decision",
-            "stake"
-        ]
-
-        available = [
-            x for x in cols
-            if x in predictions.columns
-        ]
-
-        st.dataframe(
-            predictions[
-                available
-            ].tail(20),
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.info(
-            "Henüz tahmin oluşturulmadı."
-        )
-
-
-# =========================================================
-# MAÇ EKLE
-# =========================================================
-
-elif menu == "➕ Maç Ekle":
-
-    st.subheader(
-        "➕ Maç Ekle"
-    )
-
-    with st.form("match_form"):
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            league = st.text_input(
-                "Lig",
-                placeholder="Süper Lig"
-            )
-
-            home_team = st.text_input(
-                "Ev Sahibi"
-            )
-
-        with col2:
-
-            match_date = st.datetime_input(
-                "Maç Tarihi"
-            )
-
-            away_team = st.text_input(
-                "Deplasman"
-            )
-
-        submit = st.form_submit_button(
-            "💾 MAÇI KAYDET",
-            type="primary"
-        )
-
-    if submit:
-
-        if not home_team or not away_team:
-
-            st.warning(
-                "Ev sahibi ve deplasman girilmelidir."
-            )
-
+        result = self.model.predict_match(data)
+
+        if result:
+            self.display_result(result)
+
+    def display_result(self, result):
+        """Sonucu göster"""
+        print("\n" + "="*50)
+        print("   🎯 TAHMİN SONUCU")
+        print("="*50)
+
+        # Alarm durumu
+        if result['alert']:
+            print("\n🔔 **İLK GOL ALARMI VER**")
         else:
+            print("\n⏸️ **ALARM VERME**")
 
-            data = {
-                "match_date": match_date.isoformat(),
-                "league": league,
-                "home_team": home_team.strip(),
-                "away_team": away_team.strip(),
-                "status": "pending"
-            }
+        # Detaylar
+        print(f"\n📊 İlk Gol Olasılığı: {result['probability']}%")
+        print(f"🎯 Güven Skoru: {result['confidence']}/100")
+        print(f"⚠️ Risk Skoru: {result['risk']}/100")
 
-            row = insert_row(
-                "matches",
-                data
-            )
-
-            if row:
-
-                log_audit(
-                    "matches",
-                    row.get("id"),
-                    "INSERT",
-                    None,
-                    data
-                )
-
-                st.success(
-                    "✅ Maç oluşturuldu."
-                )
-
-                st.code(
-                    str(row.get("id"))
-                )
-
-
-# =========================================================
-# ORAN EKLE
-# =========================================================
-
-elif menu == "💰 Oran Ekle":
-
-    st.subheader(
-        "💰 Maç Oranı Ekle"
-    )
-
-    matches = get_matches()
-
-    if not matches:
-
-        st.info(
-            "Önce maç oluşturmalısın."
-        )
-
-    else:
-
-        match_options = {
-            f"{m['home_team']} - {m['away_team']} | "
-            f"{m.get('league', '')} | "
-            f"{str(m.get('match_date', ''))[:16]}":
-                m
-            for m in matches
-        }
-
-        selected_text = st.selectbox(
-            "Maç",
-            list(match_options.keys())
-        )
-
-        match = match_options[
-            selected_text
-        ]
-
-        with st.form("odds_form"):
-
-            bookmaker = st.text_input(
-                "Bookmaker",
-                value="Pinnacle"
-            )
-
-            market = st.selectbox(
-                "Market",
-                [
-                    "1X2",
-                    "KG",
-                    "ÜST/ALT 1.5",
-                    "ÜST/ALT 2.5",
-                    "ÜST/ALT 3.5"
-                ]
-            )
-
-            selection_options = {
-                "1X2": ["1", "X", "2"],
-                "KG": ["VAR", "YOK"],
-                "ÜST/ALT 1.5": [
-                    "ÜST 1.5",
-                    "ALT 1.5"
-                ],
-                "ÜST/ALT 2.5": [
-                    "ÜST 2.5",
-                    "ALT 2.5"
-                ],
-                "ÜST/ALT 3.5": [
-                    "ÜST 3.5",
-                    "ALT 3.5"
-                ]
-            }
-
-            selection = st.selectbox(
-                "Seçim",
-                selection_options[
-                    market
-                ]
-            )
-
-            odds_value = st.number_input(
-                "Oran",
-                min_value=1.01,
-                value=1.85,
-                step=0.01
-            )
-
-            submit = st.form_submit_button(
-                "💾 ORANI KAYDET",
-                type="primary"
-            )
-
-        if submit:
-
-            data = {
-                "match_id": match["id"],
-                "bookmaker": bookmaker,
-                "market": market,
-                "selection": selection,
-                "odds": float(odds_value)
-            }
-
-            row = insert_row(
-                "odds",
-                data
-            )
-
-            if row:
-
-                log_audit(
-                    "odds",
-                    row.get("id"),
-                    "INSERT",
-                    None,
-                    data
-                )
-
-                st.success(
-                    "✅ Oran kaydedildi."
-                )
-
-
-# =========================================================
-# MAÇ ÖNCESİ ANALİZ
-# =========================================================
-
-elif menu == "📊 Maç Öncesi Analiz":
-
-    st.subheader(
-        "📊 MAÇ ÖNCESİ QUANT ANALİZİ"
-    )
-
-    st.warning(
-        "MODEL LOCK: Oranlar karar aşamasından önce "
-        "model λ hesaplamasına dahil edilmez."
-    )
-
-    matches = get_matches()
-
-    if not matches:
-
-        st.info(
-            "Analiz için önce maç ekle."
-        )
-
-    else:
-
-        match_options = {
-            f"{m['home_team']} - {m['away_team']} | "
-            f"{m.get('league', '')}":
-                m
-            for m in matches
-            if str(m.get("status", "pending")).lower()
-            == "pending"
-        }
-
-        if not match_options:
-
-            st.info(
-                "Analiz edilecek pending maç bulunamadı."
-            )
-
+        # Risk seviyesi
+        if result['risk'] < 33:
+            risk_level = "🟢 Düşük"
+        elif result['risk'] < 66:
+            risk_level = "🟡 Orta"
         else:
-
-            selected_text = st.selectbox(
-                "Analiz edilecek maç",
-                list(match_options.keys())
-            )
-
-            match = match_options[
-                selected_text
-            ]
-
-            history = completed_history()
-
-            if history.empty:
-
-                st.error(
-                    "Model için tamamlanmış geçmiş maç "
-                    "verisi gerekiyor."
-                )
-
-            else:
-
-                result = calculate_lambdas(
-                    match["home_team"],
-                    match["away_team"],
-                    history,
-                    sample_size
-                )
-
-                if result is None:
-
-                    st.error(
-                        "Bu iki takım için yeterli geçmiş "
-                        "verisi bulunamadı."
-                    )
-
-                else:
-
-                    lambda_home = result[
-                        "lambda_home"
-                    ]
-
-                    lambda_away = result[
-                        "lambda_away"
-                    ]
-
-                    # =====================================
-                    # MODEL LOCK
-                    # =====================================
-
-                    prob = calculate_match_probabilities(
-                        lambda_home,
-                        lambda_away
-                    )
-
-                    st.success(
-                        "🔒 MODEL LOCK TAMAMLANDI"
-                    )
-
-                    c1, c2, c3 = st.columns(3)
-
-                    c1.metric(
-                        "HOME λ",
-                        f"{lambda_home:.3f}"
-                    )
-
-                    c2.metric(
-                        "AWAY λ",
-                        f"{lambda_away:.3f}"
-                    )
-
-                    c3.metric(
-                        "Beklenen Toplam Gol",
-                        f"{lambda_home + lambda_away:.3f}"
-                    )
-
-                    st.divider()
-
-                    # =====================================
-                    # TAKIM VERİSİ
-                    # =====================================
-
-                    st.subheader(
-                        "📊 Takım Form Özeti"
-                    )
-
-                    hm = result[
-                        "home_metrics"
-                    ]
-
-                    am = result[
-                        "away_metrics"
-                    ]
-
-                    form_df = pd.DataFrame([
-                        {
-                            "Takım": match["home_team"],
-                            "Maç": hm["matches"],
-                            "GF": hm["gf"],
-                            "GA": hm["ga"],
-                            "xGF": hm["xgf"],
-                            "xGA": hm["xga"],
-                            "Şut": hm["shots"],
-                            "İsabetli Şut": hm["sot"],
-                            "Korner": hm["corners"]
-                        },
-                        {
-                            "Takım": match["away_team"],
-                            "Maç": am["matches"],
-                            "GF": am["gf"],
-                            "GA": am["ga"],
-                            "xGF": am["xgf"],
-                            "xGA": am["xga"],
-                            "Şut": am["shots"],
-                            "İsabetli Şut": am["sot"],
-                            "Korner": am["corners"]
-                        }
-                    ])
-
-                    st.dataframe(
-                        form_df,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                    # =====================================
-                    # 1X2
-                    # =====================================
-
-                    st.subheader(
-                        "🎯 MODEL OLASILIKLARI"
-                    )
-
-                    p1, px, p2 = st.columns(3)
-
-                    p1.metric(
-                        "1",
-                        pct(prob["home_win"]),
-                        f"Fair {fair_odd(prob['home_win'])}"
-                    )
-
-                    px.metric(
-                        "X",
-                        pct(prob["draw"]),
-                        f"Fair {fair_odd(prob['draw'])}"
-                    )
-
-                    p2.metric(
-                        "2",
-                        pct(prob["away_win"]),
-                        f"Fair {fair_odd(prob['away_win'])}"
-                    )
-
-                    c1, c2 = st.columns(2)
-
-                    with c1:
-
-                        st.metric(
-                            "KG VAR",
-                            pct(prob["btts_yes"]),
-                            f"Fair {fair_odd(prob['btts_yes'])}"
-                        )
-
-                        st.metric(
-                            "KG YOK",
-                            pct(prob["btts_no"]),
-                            f"Fair {fair_odd(prob['btts_no'])}"
-                        )
-
-                    with c2:
-
-                        st.metric(
-                            "ÜST 2.5",
-                            pct(prob["over_25"]),
-                            f"Fair {fair_odd(prob['over_25'])}"
-                        )
-
-                        st.metric(
-                            "ALT 2.5",
-                            pct(prob["under_25"]),
-                            f"Fair {fair_odd(prob['under_25'])}"
-                        )
-
-                    # =====================================
-                    # SKORLAR
-                    # =====================================
-
-                    st.subheader(
-                        "🔢 En Olası Skorlar"
-                    )
-
-                    score_data = top_scores(
-                        lambda_home,
-                        lambda_away,
-                        10
-                    )
-
-                    score_df = pd.DataFrame(
-                        score_data
-                    )
-
-                    score_df["Olasılık"] = (
-                        score_df["Olasılık"]
-                        * 100
-                    ).round(2)
-
-                    score_df.rename(
-                        columns={
-                            "Olasılık":
-                            "Olasılık %"
-                        },
-                        inplace=True
-                    )
-
-                    st.dataframe(
-                        score_df,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                    # =====================================
-                    # ORANLAR
-                    # =====================================
-
-                    st.divider()
-
-                    st.subheader(
-                        "💰 MODEL vs ORAN"
-                    )
-
-                    odds_rows = odds_for_match(
-                        match["id"]
-                    )
-
-                    if not odds_rows:
-
-                        st.info(
-                            "Bu maça henüz oran girilmemiş."
-                        )
-
-                    else:
-
-                        markets = build_markets(
-                            prob
-                        )
-
-                        odds_lookup = {}
-
-                        for o in odds_rows:
-
-                            key = (
-                                str(o.get("market")),
-                                str(o.get("selection"))
-                            )
-
-                            odds_lookup[key] = (
-                                safe_float(
-                                    o.get("odds")
-                                )
-                            )
-
-                        analysis_rows = []
-
-                        for m in markets:
-
-                            key = (
-                                m["market"],
-                                m["selection"]
-                            )
-
-                            bookmaker_odds = (
-                                odds_lookup.get(key)
-                            )
-
-                            probability = (
-                                m["probability"]
-                            )
-
-                            fodd = fair_odd(
-                                probability
-                            )
-
-                            ev = None
-
-                            if bookmaker_odds:
-
-                                ev = expected_value(
-                                    probability,
-                                    bookmaker_odds
-                                )
-
-                            # Confidence:
-                            # probability + data availability
-                            home_n = hm["matches"]
-                            away_n = am["matches"]
-
-                            sample_factor = min(
-                                1.0,
-                                (
-                                    home_n
-                                    + away_n
-                                ) / (
-                                    sample_size * 2
-                                )
-                            )
-
-                            confidence = (
-                                0.70
-                                * probability
-                                + 0.30
-                                * sample_factor
-                            )
-
-                            decision = "NO BET"
-
-                            if (
-                                ev is not None
-                                and ev >= min_ev
-                                and confidence >= min_confidence
-                            ):
-                                decision = "VALUE"
-
-                            analysis_rows.append({
-                                "Market":
-                                    m["market"],
-                                "Seçim":
-                                    m["selection"],
-                                "Model %":
-                                    probability * 100,
-                                "Fair Odds":
-                                    fodd,
-                                "Bookmaker":
-                                    bookmaker_odds,
-                                "EV %":
-                                    (
-                                        ev * 100
-                                        if ev is not None
-                                        else None
-                                    ),
-                                "Confidence %":
-                                    confidence * 100,
-                                "Karar":
-                                    decision
-                            })
-
-                        analysis_df = pd.DataFrame(
-                            analysis_rows
-                        )
-
-                        for col in [
-                            "Model %",
-                            "EV %",
-                            "Confidence %"
-                        ]:
-
-                            if col in analysis_df.columns:
-
-                                analysis_df[col] = (
-                                    analysis_df[col]
-                                    .round(2)
-                                )
-
-                        st.dataframe(
-                            analysis_df,
-                            use_container_width=True,
-                            hide_index=True
-                        )
-
-                        # =================================
-                        # EN İYİ VALUE
-                        # =================================
-
-                        valid_values = [
-                            x for x in analysis_rows
-                            if x["Karar"] == "VALUE"
-                        ]
-
-                        if not valid_values:
-
-                            st.warning(
-                                "⚠️ Belirlenen kriterlere "
-                                "uyan VALUE bulunamadı → NO BET."
-                            )
-
-                        else:
-
-                            best = max(
-                                valid_values,
-                                key=lambda x: safe_float(
-                                    x["EV %"]
-                                )
-                            )
-
-                            st.success(
-                                f"🎯 VALUE: "
-                                f"{best['Market']} "
-                                f"{best['Seçim']} | "
-                                f"EV %{best['EV %']:.2f}"
-                            )
-
-                            bankroll = (
-                                get_current_bankroll(
-                                    default_bankroll
-                                )
-                            )
-
-                            best_probability = (
-                                best["Model %"]
-                                / 100
-                            )
-
-                            best_odds = safe_float(
-                                best["Bookmaker"]
-                            )
-
-                            stake = quarter_kelly(
-                                best_probability,
-                                best_odds,
-                                bankroll
-                            )
-
-                            st.metric(
-                                "Önerilen Quarter Kelly",
-                                f"{stake:.2f} TL"
-                            )
-
-                            # =================================
-                            # TAHMİNİ KAYDET
-                            # =================================
-
-                            if st.button(
-                                "💾 EN İYİ VALUE TAHMİNİNİ KAYDET",
-                                type="primary"
-                            ):
-
-                                # tekrar kayıtları önlemek için
-                                existing = get_predictions()
-
-                                already = False
-
-                                for p in existing:
-
-                                    if (
-                                        str(
-                                            p.get("match_id")
-                                        )
-                                        == str(match["id"])
-                                        and
-                                        p.get("market")
-                                        == best["Market"]
-                                        and
-                                        p.get("selection")
-                                        == best["Seçim"]
-                                        and
-                                        p.get("model_version")
-                                        == MODEL_VERSION
-                                    ):
-
-                                        already = True
-
-                                if already:
-
-                                    st.warning(
-                                        "Bu model tahmini "
-                                        "zaten kayıtlı."
-                                    )
-
-                                else:
-
-                                    confidence_value = (
-                                        best["Confidence %"]
-                                        / 100
-                                    )
-
-                                    ev_decimal = (
-                                        best["EV %"]
-                                        / 100
-                                    )
-
-                                    row = save_prediction(
-                                        match_id=match["id"],
-                                        market=best["Market"],
-                                        selection=best["Seçim"],
-                                        probability=best_probability,
-                                        fair_odds=best["Fair Odds"],
-                                        bookmaker_odds=best_odds,
-                                        ev=ev_decimal,
-                                        confidence=confidence_value,
-                                        decision="BET",
-                                        stake=stake,
-                                        bankroll_before=bankroll
-                                    )
-
-                                    if row:
-
-                                        st.success(
-                                            "✅ Tahmin predictions "
-                                            "tablosuna kaydedildi."
-                                        )
-
-
-# =========================================================
-# SONUÇ GİR
-# =========================================================
-
-elif menu == "🏁 Sonuç Gir":
-
-    st.subheader(
-        "🏁 Tahmin Sonucu"
-    )
-
-    predictions = get_predictions()
-
-    results = get_prediction_results()
-
-    settled_ids = {
-        str(x.get("prediction_id"))
-        for x in results
-    }
-
-    pending = [
-        x for x in predictions
-        if str(x.get("id"))
-        not in settled_ids
-    ]
-
-    if not pending:
-
-        st.info(
-            "Sonuç bekleyen tahmin yok."
-        )
-
-    else:
-
-        options = {
-            f"{x.get('market')} "
-            f"{x.get('selection')} | "
-            f"Oran {x.get('bookmaker_odds')} | "
-            f"Stake {x.get('stake')}":
-                x
-            for x in pending
-        }
-
-        selected_text = st.selectbox(
-            "Tahmin seç",
-            list(options.keys())
-        )
-
-        prediction = options[
-            selected_text
-        ]
-
-        st.write(
-            f"**Market:** {prediction.get('market')}"
-        )
-
-        st.write(
-            f"**Seçim:** {prediction.get('selection')}"
-        )
-
-        st.write(
-            f"**Model olasılığı:** "
-            f"{safe_float(prediction.get('predicted_probability')) * 100:.2f}%"
-        )
-
-        result = st.radio(
-            "Sonuç",
-            [
-                "KAZANDI",
-                "KAYBETTİ",
-                "İADE"
-            ],
-            horizontal=True
-        )
-
-        if st.button(
-            "🏁 SONUCU KAYDET",
-            type="primary"
-        ):
-
-            stake = safe_float(
-                prediction.get("stake")
-            )
-
-            odds_value = safe_float(
-                prediction.get("bookmaker_odds")
-            )
-
-            bankroll_before = safe_float(
-                prediction.get("bankroll_before")
-            )
-
-            if result == "KAZANDI":
-
-                profit_loss = (
-                    stake
-                    * (
-                        odds_value - 1
-                    )
-                )
-
-            elif result == "KAYBETTİ":
-
-                profit_loss = -stake
-
-            else:
-
-                profit_loss = 0.0
-
-            bankroll_after = (
-                bankroll_before
-                + profit_loss
-            )
-
-            result_data = {
-                "prediction_id":
-                    prediction["id"],
-                "result":
-                    result,
-                "profit_loss":
-                    round(
-                        profit_loss,
-                        2
-                    ),
-                "settled_odds":
-                    odds_value,
-                "settled_at":
-                    utc_now(),
-                "manually_corrected":
-                    False
-            }
-
-            result_row = insert_row(
-                "prediction_results",
-                result_data
-            )
-
-            if result_row:
-
-                log_audit(
-                    "prediction_results",
-                    result_row.get("id"),
-                    "INSERT",
-                    None,
-                    result_data
-                )
-
-                # -----------------------------
-                # BANKROLL
-                # -----------------------------
-
-                bankroll_data = {
-                    "prediction_id":
-                        prediction["id"],
-                    "bankroll_before":
-                        bankroll_before,
-                    "stake":
-                        stake,
-                    "profit_loss":
-                        round(
-                            profit_loss,
-                            2
-                        ),
-                    "bankroll_after":
-                        round(
-                            bankroll_after,
-                            2
-                        )
-                }
-
-                bank_row = insert_row(
-                    "bankroll_history",
-                    bankroll_data
-                )
-
-                if bank_row:
-
-                    log_audit(
-                        "bankroll_history",
-                        bank_row.get("id"),
-                        "INSERT",
-                        None,
-                        bankroll_data
-                    )
-
-                st.success(
-                    f"✅ {result} | "
-                    f"Kâr/Zarar: "
-                    f"{profit_loss:.2f} TL | "
-                    f"Yeni Kasa: "
-                    f"{bankroll_after:.2f} TL"
-                )
-
-                st.rerun()
-
-
-# =========================================================
-# TAHMİN GEÇMİŞİ
-# =========================================================
-
-elif menu == "📚 Tahmin Geçmişi":
-
-    st.subheader(
-        "📚 Tahmin Geçmişi"
-    )
-
-    predictions = pd.DataFrame(
-        get_predictions()
-    )
-
-    if predictions.empty:
-
-        st.info(
-            "Henüz tahmin yok."
-        )
-
-    else:
-
-        st.dataframe(
-            predictions.sort_values(
-                "created_at",
-                ascending=False
-            ),
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-# =========================================================
-# PERFORMANS
-# =========================================================
-
-elif menu == "📈 Performans":
-
-    st.subheader(
-        "📈 Model Performansı"
-    )
-
-    predictions = pd.DataFrame(
-        get_predictions()
-    )
-
-    results = pd.DataFrame(
-        get_prediction_results()
-    )
-
-    if predictions.empty or results.empty:
-
-        st.info(
-            "Performans için tahmin ve sonuç "
-            "verisi gerekiyor."
-        )
-
-    else:
-
-        df = predictions.merge(
-            results[
-                [
-                    "prediction_id",
-                    "result",
-                    "profit_loss"
-                ]
-            ],
-            left_on="id",
-            right_on="prediction_id",
-            how="inner"
-        )
-
-        if df.empty:
-
-            st.info(
-                "Henüz sonuçlanmış tahmin yok."
-            )
-
-        else:
-
-            won = len(
-                df[
-                    df["result"]
-                    == "KAZANDI"
-                ]
-            )
-
-            lost = len(
-                df[
-                    df["result"]
-                    == "KAYBETTİ"
-                ]
-            )
-
-            total = won + lost
-
-            total_profit = df[
-                "profit_loss"
-            ].fillna(0).sum()
-
-            total_stake = df[
-                "stake"
-            ].fillna(0).sum()
-
-            win_rate = (
-                won / total * 100
-                if total > 0
-                else 0
-            )
-
-            roi = (
-                total_profit
-                / total_stake
-                * 100
-                if total_stake > 0
-                else 0
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            c1.metric(
-                "Kazandı",
-                won
-            )
-
-            c2.metric(
-                "Kaybetti",
-                lost
-            )
-
-            c3.metric(
-                "Win Rate",
-                f"{win_rate:.2f}%"
-            )
-
-            c4.metric(
-                "ROI",
-                f"{roi:.2f}%"
-            )
-
-            st.metric(
-                "Toplam Kâr/Zarar",
-                f"{total_profit:.2f} TL"
-            )
-
-            st.divider()
-
-            st.subheader(
-                "Tahmin Sonuçları"
-            )
-
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-
-# =========================================================
-# KALİBRASYON
-# =========================================================
-
-elif menu == "🧠 Kalibrasyon":
-
-    st.subheader(
-        "🧠 MODEL KALİBRASYONU"
-    )
-
-    predictions = pd.DataFrame(
-        get_predictions()
-    )
-
-    results = pd.DataFrame(
-        get_prediction_results()
-    )
-
-    if predictions.empty or results.empty:
-
-        st.info(
-            "Kalibrasyon için sonuçlanmış "
-            "tahmin gerekiyor."
-        )
-
-    else:
-
-        df = predictions.merge(
-            results[
-                [
-                    "prediction_id",
-                    "result"
-                ]
-            ],
-            left_on="id",
-            right_on="prediction_id",
-            how="inner"
-        )
-
-        df = df[
-            df["result"].isin(
-                [
-                    "KAZANDI",
-                    "KAYBETTİ"
-                ]
-            )
-        ].copy()
-
-        if len(df) < 10:
-
-            st.info(
-                f"Kalibrasyon için en az 10 "
-                f"sonuç gerekli. Mevcut: {len(df)}"
-            )
-
-        else:
-
-            df["actual"] = (
-                df["result"]
-                == "KAZANDI"
-            ).astype(int)
-
-            df["p"] = pd.to_numeric(
-                df[
-                    "predicted_probability"
-                ],
-                errors="coerce"
-            )
-
-            df = df.dropna(
-                subset=["p"]
-            )
-
-            accuracy = (
-                df["actual"].mean()
-            )
-
-            brier = (
-                (
-                    df["p"]
-                    - df["actual"]
-                ) ** 2
-            ).mean()
-
-            avg_prediction = (
-                df["p"].mean()
-            )
-
-            c1, c2, c3 = st.columns(3)
-
-            c1.metric(
-                "Accuracy",
-                f"{accuracy * 100:.2f}%"
-            )
-
-            c2.metric(
-                "Brier Score",
-                f"{brier:.4f}"
-            )
-
-            c3.metric(
-                "Ortalama Model Olasılığı",
-                f"{avg_prediction * 100:.2f}%"
-            )
-
-            st.divider()
-
-            st.subheader(
-                "Kalibrasyon Verisini Güncelle"
-            )
-
-            for _, row in df.iterrows():
-
-                prediction_id = row["id"]
-
-                predicted_probability = safe_float(
-                    row["p"]
-                )
-
-                actual_result = safe_float(
-                    row["actual"]
-                )
-
-                prediction_error = (
-                    actual_result
-                    - predicted_probability
-                )
-
-                existing = fetch_table(
-                    "calibration_data",
-                    "*"
-                )
-
-                exists = any(
-                    str(x.get("prediction_id"))
-                    == str(prediction_id)
-                    for x in existing
-                )
-
-                if not exists:
-
-                    calibration = {
-                        "prediction_id":
-                            prediction_id,
-                        "predicted_probability":
-                            predicted_probability,
-                        "actual_result":
-                            actual_result,
-                        "prediction_error":
-                            prediction_error,
-                        "model_version":
-                            row.get(
-                                "model_version",
-                                MODEL_VERSION
-                            )
-                    }
-
-                    insert_row(
-                        "calibration_data",
-                        calibration
-                    )
-
-            # Model settings
-            existing_settings = fetch_table(
-                "model_settings",
-                "*"
-            )
-
-            parameters = {
-                "sample_size":
-                    sample_size,
-                "min_ev":
-                    min_ev,
-                "min_confidence":
-                    min_confidence,
-                "method":
-                    "Poisson",
-                "model":
-                    MODEL_VERSION
-            }
-
-            settings_data = {
-                "model_version":
-                    MODEL_VERSION,
-                "parameters":
-                    parameters,
-                "calibration_sample_size":
-                    len(df),
-                "accuracy":
-                    accuracy,
-                "brier_score":
-                    brier
-            }
-
-            if existing_settings:
-
-                latest = existing_settings[-1]
-
-                update_row(
-                    "model_settings",
-                    latest["id"],
-                    settings_data
-                )
-
-            else:
-
-                insert_row(
-                    "model_settings",
-                    settings_data
-                )
-
-            st.success(
-                "✅ Kalibrasyon verileri güncellendi."
-            )
-
-            st.dataframe(
-                df[
-                    [
-                        "market",
-                        "selection",
-                        "predicted_probability",
-                        "actual"
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True
-                            )
+            risk_level = "🔴 Yüksek"
+        print(f"📈 Risk Seviyesi: {risk_level}")
+
+        print(f"\n⏱️ Beklenen İlk Gol: {result['expected_goal_minute']}. dakika")
+        print(f"📌 Alarm Eşiği: {result['threshold']}%")
+
+        # Benzer maçlar
+        print(f"\n📊 Benzer Maç Sayısı: {result['similar_matches_count']}")
+        print(f"📈 Benzer Maç Başarısı: {result['similar_success_rate']*100:.1f}%")
+
+        print("\n" + "-"*50)
+
+    def show_performance(self):
+        """Model performansını göster"""
+        print("\n" + "="*50)
+        print("   📊 MODEL PERFORMANSI")
+        print("="*50)
+
+        print(f"\n📌 Model Versiyonu: {self.model.model_version}")
+        print(f"📅 Son Eğitim: {self.model.last_training_date}")
+        print(f"🎯 Alarm Eşiği: {self.model.threshold*100:.1f}%")
+        print(f"📊 Özellik Sayısı: {len(self.model.feature_columns)}")
+
+        if hasattr(self.model, 'feature_importances'):
+            print("\n🔝 En Önemli Özellikler:")
+            importances = self.model.feature_importances
+            for idx in np.argsort(importances)[-5:][::-1]:
+                print(f"  - {self.model.feature_columns[idx]}: {importances[idx]:.3f}")
+
+        print("\n💡 Öneri:")
+        print("  - Yeni maç verileri geldikçe modeli yeniden eğitin")
+        print("  - Veri arttıkça doğruluk artacaktır")
+
+    def run_batch_simulation(self):
+        """Toplu simülasyon çalıştır"""
+        print("\n" + "="*50)
+        print("   🔄 TOPLU SİMÜLASYON")
+        print("="*50)
+
+        n = input("\nKaç maç simüle edilsin? (10-100): ").strip()
+        n = int(n) if n else 10
+        n = max(10, min(100, n))
+
+        print(f"\n🎲 {n} maç simüle ediliyor...")
+
+        results = []
+        for i in range(1, n+1):
+            sim_results = self.simulator.simulate_match(i)
+            if sim_results:
+                # En yüksek olasılıklı senaryoyu al
+                best = max(sim_results, key=lambda x: x['probability'])
+                results.append(best)
+                print(f"  Maç {i}: {best['probability']}% - {'🔔' if best['alert'] else '⏸️'}")
+
+        # Özet
+        if results:
+            alert_count = sum(1 for r in results if r['alert'])
+            avg_prob = np.mean([r['probability'] for r in results])
+            avg_conf = np.mean([r['confidence'] for r in results])
+
+            print(f"\n📊 ÖZET:")
+            print(f"  Toplam Maç: {len(results)}")
+            print(f"  Alarm Verilen: {alert_count} ({alert_count/len(results)*100:.1f}%)")
+            print(f"  Ortalama Olasılık: {avg_prob:.1f}%")
+            print(f"  Ortalama Güven: {avg_conf:.1f}/100")
+
+
+# ==================== UYGULAMAYI BAŞLAT ====================
+
+if __name__ == "__main__":
+    app = MobileApp()
+    app.start()
